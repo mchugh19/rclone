@@ -162,6 +162,32 @@ we have to rely on user password authentication for it.`,
 			Help:       "Your pcloud password.",
 			IsPassword: true,
 			Advanced:   true,
+		}, {
+			Name: "upload_verification",
+			Help: `Verify uploads by re-reading the object after it is written.
+
+pCloud provides a checksum for every stored object, so an upload
+can be checked end to end: rclone hashes the data as it is
+uploaded, then re-reads the stored object and compares its size
+and hash with the data which was sent. A freshly uploaded object
+is not always visible to metadata reads straight away, so
+verification waits up to --pcloud-upload-verification-wait for it
+to become readable. An object which cannot be verified is
+deleted and the upload fails, so it can be retried cleanly.
+
+Verification costs extra API calls per upload.`,
+			Default:  false,
+			Advanced: true,
+		}, {
+			Name: "upload_verification_wait",
+			Help: `Maximum time to wait for an uploaded object to become visible for verification.
+
+Only used when upload verification is enabled. A freshly uploaded
+object is not always visible to metadata reads straight away, and
+can be listed before its hash is available, so verification waits
+and re-reads until the object can be checked, up to this long.`,
+			Default:  fs.Duration(30 * time.Second),
+			Advanced: true,
 		},
 		}...),
 	})
@@ -169,11 +195,13 @@ we have to rely on user password authentication for it.`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	Enc          encoder.MultiEncoder `config:"encoding"`
-	RootFolderID string               `config:"root_folder_id"`
-	Hostname     string               `config:"hostname"`
-	Username     string               `config:"username"`
-	Password     string               `config:"password"`
+	Enc                    encoder.MultiEncoder `config:"encoding"`
+	RootFolderID           string               `config:"root_folder_id"`
+	Hostname               string               `config:"hostname"`
+	Username               string               `config:"username"`
+	Password               string               `config:"password"`
+	UploadVerification     bool                 `config:"upload_verification"`
+	UploadVerificationWait fs.Duration          `config:"upload_verification_wait"`
 }
 
 // Fs represents a remote pcloud
@@ -1492,6 +1520,19 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return errors.New("can't upload unknown sizes objects")
 	}
 
+	// Hash the data as it is uploaded if verification is on, so the
+	// stored object can be checked against the bytes which were
+	// actually sent.
+	var hasher *hash.MultiHasher
+	if o.fs.opt.UploadVerification {
+		var err error
+		hasher, err = hash.NewMultiHasherTypes(o.fs.Hashes())
+		if err != nil {
+			return fmt.Errorf("failed to create upload hasher: %w", err)
+		}
+		in = io.TeeReader(in, hasher)
+	}
+
 	// Create the directory for the object if it doesn't exist
 	leaf, directoryID, err := o.fs.dirCache.FindPath(ctx, remote, true)
 	if err != nil {
@@ -1568,8 +1609,95 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if len(result.Items) != 1 {
 		return fmt.Errorf("failed to upload %v - not sure why", o)
 	}
+	if hasher != nil {
+		if err := o.verifyUpload(ctx, size, hasher.Sums()); err != nil {
+			// delete the object which failed verification, as
+			// in the error path above, so it can be retried
+			for range 5 {
+				delObj, delErr := o.fs.NewObject(ctx, o.remote)
+				if delErr == nil && delObj != nil {
+					_ = delObj.Remove(ctx)
+					break
+				}
+				time.Sleep(time.Second)
+			}
+			return err
+		}
+	}
 	o.setHashes(&result.Checksums[0])
 	return o.setMetaData(&result.Items[0])
+}
+
+// uploadVerifyPollInterval is how often verifyUpload re-reads the
+// stored object's metadata while waiting for it to become visible.
+const uploadVerifyPollInterval = 2 * time.Second
+
+// verifyUpload re-reads the stored object and checks its size and
+// hash against the data which was uploaded, as summed in sums.
+//
+// pCloud is eventually consistent: a freshly uploaded object can be
+// missing from listings, or listed before its hash is available,
+// for a while after the upload call has reported success. Those
+// states, and a listing still showing a previous version of the
+// object, are waited out up to the upload_verification_wait limit.
+// If the object cannot be verified within the limit then an error
+// is returned and the upload is treated as failed.
+func (o *Object) verifyUpload(ctx context.Context, size int64, sums map[hash.Type]string) error {
+	hashType, wantHash, err := strongestHash(sums)
+	if err != nil {
+		return err
+	}
+	wait := time.Duration(o.fs.opt.UploadVerificationWait)
+	deadline := time.Now().Add(wait)
+	var lastErr error
+	lastSize := int64(-1)
+	lastHash := ""
+	for {
+		stored, err := o.fs.NewObject(ctx, o.remote)
+		if err != nil {
+			lastErr = err
+		} else {
+			lastSize = stored.Size()
+			lastHash, err = stored.Hash(ctx, hashType)
+			if err != nil {
+				lastErr = err
+				lastHash = ""
+			} else if checkUploadedObject(size, lastSize, wantHash, lastHash) {
+				fs.Debugf(o, "verified upload: size %d, %s %s", size, hashType, lastHash)
+				return nil
+			}
+		}
+		if time.Now().After(deadline) {
+			if lastSize >= 0 {
+				return fmt.Errorf("upload verification failed: stored object has size %d and %s %q after %v, uploaded size %d and %s %q", lastSize, hashType, lastHash, wait, size, hashType, wantHash)
+			}
+			return fmt.Errorf("upload verification failed: object not visible within %v: %w", wait, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(uploadVerifyPollInterval):
+		}
+	}
+}
+
+// checkUploadedObject reports whether a stored object matches the
+// uploaded data: same size, and a stored hash equal to wantHash. An
+// empty storedHash means pCloud has not reported a hash for the
+// object yet, so it cannot match.
+func checkUploadedObject(size, storedSize int64, wantHash, storedHash string) bool {
+	return storedSize == size && storedHash != "" && strings.EqualFold(storedHash, wantHash)
+}
+
+// strongestHash picks the hash to verify with out of sums, strongest
+// first.
+func strongestHash(sums map[hash.Type]string) (hash.Type, string, error) {
+	for _, hashType := range []hash.Type{hash.SHA256, hash.SHA1, hash.MD5} {
+		if sum, ok := sums[hashType]; ok && sum != "" {
+			return hashType, sum, nil
+		}
+	}
+	return hash.None, "", errors.New("no hash of the uploaded data to verify against")
 }
 
 // Remove an object
