@@ -44,6 +44,13 @@ const (
 	maxSleep                    = 2 * time.Second
 	decayConstant               = 2 // bigger for slower decay, exponential
 	defaultHostname             = "api.pcloud.com"
+	// 48Mi measured fastest against pcloud's ~1 MiB/s large upload throttle
+	// (8Mi 0.39, 48Mi 1.05, 128Mi 0.93 MiB/s)
+	defaultChunkSize = 48 * fs.Mebi
+	// a file this size re-sends in a few minutes, cheaper than session overhead
+	defaultUploadCutoff = 256 * fs.Mebi
+	minChunkSize        = 1 * fs.Mebi // zero would never advance the upload loop
+	minUploadCutoff     = 1 * fs.Mebi
 )
 
 // Globals
@@ -188,6 +195,22 @@ can be listed before its hash is available, so verification waits
 and re-reads until the object can be checked, up to this long.`,
 			Default:  fs.Duration(30 * time.Second),
 			Advanced: true,
+		}, {
+			Name: "upload_cutoff",
+			Help: `Cutoff for switching to chunked upload.
+
+Files above this size are uploaded in chunks using a resumable upload
+session, so a dropped connection continues from the last byte the server
+committed instead of restarting the file.`,
+			Default:  defaultUploadCutoff,
+			Advanced: true,
+		}, {
+			Name: "chunk_size",
+			Help: `Chunk size to use for uploading.
+
+Note that the chunks are buffered in memory, one per transfer.`,
+			Default:  defaultChunkSize,
+			Advanced: true,
 		},
 		}...),
 	})
@@ -202,6 +225,8 @@ type Options struct {
 	Password               string               `config:"password"`
 	UploadVerification     bool                 `config:"upload_verification"`
 	UploadVerificationWait fs.Duration          `config:"upload_verification_wait"`
+	UploadCutoff           fs.SizeSuffix        `config:"upload_cutoff"`
+	ChunkSize              fs.SizeSuffix        `config:"chunk_size"`
 }
 
 // Fs represents a remote pcloud
@@ -355,6 +380,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	err := configstruct.Set(m, opt)
 	if err != nil {
 		return nil, err
+	}
+	if opt.ChunkSize < minChunkSize {
+		return nil, fmt.Errorf("pcloud: chunk size (%v) must be at least %v", opt.ChunkSize, minChunkSize)
+	}
+	if opt.UploadCutoff < minUploadCutoff {
+		return nil, fmt.Errorf("pcloud: upload cutoff (%v) must be at least %v", opt.UploadCutoff, minUploadCutoff)
 	}
 	root = parsePath(root)
 	oAuthClient, ts, err := oauthutil.NewClient(ctx, name, m, oauthConfig)
@@ -1539,6 +1570,28 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		return err
 	}
 
+	if size > int64(o.fs.opt.UploadCutoff) {
+		create, err := uploadCreate(ctx, o.fs, size)
+		if err != nil {
+			return err
+		}
+		err = o.uploadSession(ctx, in, src, o.fs.opt.Enc.FromStandardName(leaf), directoryID, create.UploadID, options...)
+		if err != nil {
+			return err
+		}
+		// uploadSession read the stream exactly once (retries
+		// re-send from its in-memory chunk buffers), so the hasher
+		// holds the sums of the bytes which were committed and the
+		// stored object can be verified as on the plain path.
+		if hasher != nil {
+			if err := o.verifyUpload(ctx, size, hasher.Sums()); err != nil {
+				o.deleteSavedObject(ctx)
+				return err
+			}
+		}
+		return nil
+	}
+
 	// Experiments with pcloud indicate that it doesn't like any
 	// form of request which doesn't have a Content-Length.
 	// According to the docs if you close the connection at the
@@ -1595,15 +1648,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	})
 	if err != nil {
 		// sometimes pcloud leaves a half complete file on
-		// error, so delete it if it exists, trying a few times
-		for range 5 {
-			delObj, delErr := o.fs.NewObject(ctx, o.remote)
-			if delErr == nil && delObj != nil {
-				_ = delObj.Remove(ctx)
-				break
-			}
-			time.Sleep(time.Second)
-		}
+		// error, so delete it if it exists
+		o.deleteSavedObject(ctx)
 		return err
 	}
 	if len(result.Items) != 1 {
@@ -1613,19 +1659,28 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		if err := o.verifyUpload(ctx, size, hasher.Sums()); err != nil {
 			// delete the object which failed verification, as
 			// in the error path above, so it can be retried
-			for range 5 {
-				delObj, delErr := o.fs.NewObject(ctx, o.remote)
-				if delErr == nil && delObj != nil {
-					_ = delObj.Remove(ctx)
-					break
-				}
-				time.Sleep(time.Second)
-			}
+			o.deleteSavedObject(ctx)
 			return err
 		}
 	}
 	o.setHashes(&result.Checksums[0])
 	return o.setMetaData(&result.Items[0])
+}
+
+// deleteSavedObject removes the file an upload has just stored at
+// o's remote, trying a few times: a freshly stored file can take a
+// moment to become visible to the lookup. Used when an upload or
+// its verification fails, so no half complete or unverified file is
+// left behind and the transfer can be retried cleanly.
+func (o *Object) deleteSavedObject(ctx context.Context) {
+	for range 5 {
+		delObj, err := o.fs.NewObject(ctx, o.remote)
+		if err == nil && delObj != nil {
+			_ = delObj.Remove(ctx)
+			return
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 // uploadVerifyPollInterval is how often verifyUpload re-reads the
