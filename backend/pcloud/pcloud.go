@@ -1575,7 +1575,21 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		if err != nil {
 			return err
 		}
-		return o.uploadSession(ctx, in, src, o.fs.opt.Enc.FromStandardName(leaf), directoryID, create.UploadID, options...)
+		err = o.uploadSession(ctx, in, src, o.fs.opt.Enc.FromStandardName(leaf), directoryID, create.UploadID, options...)
+		if err != nil {
+			return err
+		}
+		// uploadSession read the stream exactly once (retries
+		// re-send from its in-memory chunk buffers), so the hasher
+		// holds the sums of the bytes which were committed and the
+		// stored object can be verified as on the plain path.
+		if hasher != nil {
+			if err := o.verifyUpload(ctx, size, hasher.Sums()); err != nil {
+				o.deleteSavedObject(ctx)
+				return err
+			}
+		}
+		return nil
 	}
 
 	// Experiments with pcloud indicate that it doesn't like any
@@ -1634,15 +1648,8 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	})
 	if err != nil {
 		// sometimes pcloud leaves a half complete file on
-		// error, so delete it if it exists, trying a few times
-		for range 5 {
-			delObj, delErr := o.fs.NewObject(ctx, o.remote)
-			if delErr == nil && delObj != nil {
-				_ = delObj.Remove(ctx)
-				break
-			}
-			time.Sleep(time.Second)
-		}
+		// error, so delete it if it exists
+		o.deleteSavedObject(ctx)
 		return err
 	}
 	if len(result.Items) != 1 {
@@ -1652,19 +1659,28 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		if err := o.verifyUpload(ctx, size, hasher.Sums()); err != nil {
 			// delete the object which failed verification, as
 			// in the error path above, so it can be retried
-			for range 5 {
-				delObj, delErr := o.fs.NewObject(ctx, o.remote)
-				if delErr == nil && delObj != nil {
-					_ = delObj.Remove(ctx)
-					break
-				}
-				time.Sleep(time.Second)
-			}
+			o.deleteSavedObject(ctx)
 			return err
 		}
 	}
 	o.setHashes(&result.Checksums[0])
 	return o.setMetaData(&result.Items[0])
+}
+
+// deleteSavedObject removes the file an upload has just stored at
+// o's remote, trying a few times: a freshly stored file can take a
+// moment to become visible to the lookup. Used when an upload or
+// its verification fails, so no half complete or unverified file is
+// left behind and the transfer can be retried cleanly.
+func (o *Object) deleteSavedObject(ctx context.Context) {
+	for range 5 {
+		delObj, err := o.fs.NewObject(ctx, o.remote)
+		if err == nil && delObj != nil {
+			_ = delObj.Remove(ctx)
+			return
+		}
+		time.Sleep(time.Second)
+	}
 }
 
 // uploadVerifyPollInterval is how often verifyUpload re-reads the
